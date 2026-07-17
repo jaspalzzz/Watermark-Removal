@@ -493,6 +493,11 @@ const MATCH_SAMPLES = 12;
 async function buildAverageLuma() {
   const width = video.videoWidth;
   const height = video.videoHeight;
+  const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+  // Without a duration there is nothing to spread samples across, and a single frame is not
+  // enough to match on: it scored 0.51 and landed 20px off the watermark while testing.
+  if (!duration) return null;
+
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
@@ -501,10 +506,10 @@ async function buildAverageLuma() {
   const restoreTo = video.currentTime;
   let samples = 0;
 
+  // Sample midpoints rather than i/N: the first slot would otherwise land on 0s, where seeking
+  // to the position the video already holds may never fire "seeked".
   for (let i = 0; i < MATCH_SAMPLES; i += 1) {
-    const target = (video.duration || 0) * (i / MATCH_SAMPLES);
-    if (!Number.isFinite(target)) break;
-    if (!(await seekTo(target))) break;
+    if (!(await seekTo(duration * ((i + 0.5) / MATCH_SAMPLES)))) continue;
 
     context.drawImage(video, 0, 0);
     const { data } = context.getImageData(0, 0, width, height);
@@ -523,6 +528,18 @@ async function buildAverageLuma() {
 
 function seekTo(time) {
   return new Promise((resolveSeek) => {
+    if (!Number.isFinite(time)) {
+      resolveSeek(false);
+      return;
+    }
+
+    const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+    const target = duration ? clamp(time, 0, Math.max(0, duration - 0.05)) : time;
+    if (Math.abs(video.currentTime - target) < 0.025 && video.readyState >= 2) {
+      resolveSeek(true);
+      return;
+    }
+
     const done = () => {
       video.removeEventListener("seeked", done);
       window.clearTimeout(timer);
@@ -533,7 +550,13 @@ function seekTo(time) {
       resolveSeek(false);
     }, 2000);
     video.addEventListener("seeked", done);
-    video.currentTime = time;
+    try {
+      video.currentTime = target;
+    } catch {
+      video.removeEventListener("seeked", done);
+      window.clearTimeout(timer);
+      resolveSeek(false);
+    }
   });
 }
 
