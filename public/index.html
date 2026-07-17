@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Video Watermark Cleaner</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace" aria-label="Video editor">
+        <div class="video-panel">
+          <div class="drop-zone" id="dropZone">
+            <input id="videoInput" type="file" accept="video/mp4,video/quicktime,video/webm,video/*" />
+            <div class="drop-copy">
+              <span class="drop-icon" aria-hidden="true">+</span>
+              <strong>Drop video here</strong>
+              <span>Watermark removal starts automatically</span>
+              <small>MP4, MOV, WebM</small>
+            </div>
+          </div>
+
+          <div class="stage is-empty" id="stage">
+            <video id="video" controls playsinline preload="auto"></video>
+            <canvas id="overlay"></canvas>
+          </div>
+        </div>
+
+        <aside class="controls" aria-label="Controls">
+          <div class="brand-row">
+            <div>
+              <h1>Watermark Cleaner</h1>
+              <p>For videos you own or have permission to edit.</p>
+            </div>
+          </div>
+
+          <div class="control-group">
+            <label>Detection</label>
+            <button id="detectButton" type="button" disabled>Auto detect watermark</button>
+          </div>
+
+          <div class="job-card" id="jobCard" aria-live="polite">
+            <div class="job-header">
+              <span id="jobLabel">Ready</span>
+              <span id="jobPercent">0%</span>
+            </div>
+            <div class="progress-track" aria-hidden="true">
+              <div class="progress-bar" id="progressBar"></div>
+            </div>
+            <ol class="job-steps">
+              <li data-step="upload">Upload</li>
+              <li data-step="detect">Detect</li>
+              <li data-step="process">Remove</li>
+              <li data-step="done">Done</li>
+            </ol>
+          </div>
+
+          <div class="control-group">
+            <label for="mode">Output</label>
+            <select id="mode">
+              <option value="source">Match uploaded quality</option>
+              <option value="fast">Faster export</option>
+            </select>
+          </div>
+
+          <div class="control-group">
+            <div class="row-heading">
+              <span>Selected areas</span>
+              <button id="clearRegions" type="button" aria-label="Clear selected areas">Clear</button>
+            </div>
+            <ul class="region-list" id="regionList"></ul>
+          </div>
+
+          <button class="primary-action" id="processButton" type="button" disabled>
+            Process again
+          </button>
+
+          <div class="status" id="status" role="status" aria-live="polite"></div>
+          <a class="download-link" id="downloadLink" hidden>Download result</a>
+        </aside>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

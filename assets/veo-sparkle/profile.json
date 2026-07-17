@@ -1,0 +1,23 @@
+{
+  "name": "veo-sparkle",
+  "description": "Google Veo / Gemini four-point sparkle watermark. Per-pixel affine (gain/offset) model calibrated from a matched watermarked/clean pair; reverses the alpha blend instead of interpolating the area away.",
+  "reference": {
+    "width": 720,
+    "height": 1280
+  },
+  "patch": {
+    "width": 120,
+    "height": 112
+  },
+  "sparkle": {
+    "x": 576,
+    "y": 1136,
+    "width": 48,
+    "height": 48
+  },
+  "anchor": {
+    "x": 32,
+    "y": 32
+  },
+  "peakAlpha": 0.3757
+}
