@@ -241,17 +241,104 @@ async function handleImageLoaded() {
   const suggestion = matchWatermarkProfile(profile, frame, IMAGE_SUGGEST_THRESHOLD);
 
   if (suggestion) {
-    // Confirmed by the user rather than by score, so the server allows the un-blend through.
-    watermarkMatch = { ...suggestion, confirmed: true };
+    // Position only — the removal itself goes through the traced-outline path rather than the
+    // calibrated un-blend. Un-blending needs the profile's glyph to match the one in the file,
+    // and a still gives no way to confirm that: a Gemini image carries a different mark from
+    // the Veo clip the profile was built from, and using it there only half-removes the mark.
+    watermarkMatch = null;
     regions = [{ x: suggestion.x, y: suggestion.y, w: suggestion.w, h: suggestion.h }];
     updateUi();
     setProgress(30, "Check the area", "detect");
-    setStatus("Found a likely Veo sparkle (highlighted). Press Remove watermark to confirm, or drag your own box.");
+    setStatus("Found a likely watermark (highlighted). Press Remove watermark to confirm, or drag your own box.");
     return;
   }
 
   autoDetectWatermark();
   setStatus("No known watermark found. Drag a box over the watermark, then press Remove watermark.");
+}
+
+// Traces the watermark inside each selected region: a watermark is brighter than the picture
+// around it, so pixels well above the region's own border brightness are the glyph. Returns a
+// full-frame black/white PNG for ffmpeg's removelogo, or null if nothing stands out.
+const SHAPE_SIGMA = 2.2; // how far above the border brightness a pixel must sit
+const SHAPE_GROW = 3; // covers the mark's soft anti-aliased rim
+
+async function buildShapeMask() {
+  const width = mediaWidth();
+  const height = mediaHeight();
+  if (!width || !height || !regions.length) return null;
+
+  const source = document.createElement("canvas");
+  source.width = width;
+  source.height = height;
+  const sctx = source.getContext("2d", { willReadFrequently: true });
+  sctx.drawImage(activeMedia(), 0, 0, width, height);
+
+  const flags = new Uint8Array(width * height);
+  let marked = 0;
+
+  for (const region of regions) {
+    const x0 = clamp(Math.round(region.x), 0, width - 1);
+    const y0 = clamp(Math.round(region.y), 0, height - 1);
+    const w = clamp(Math.round(region.w), 1, width - x0);
+    const h = clamp(Math.round(region.h), 1, height - y0);
+    const { data } = sctx.getImageData(x0, y0, w, h);
+
+    const luma = new Float32Array(w * h);
+    for (let p = 0; p < luma.length; p += 1) {
+      const o = p * 4;
+      luma[p] = 0.299 * data[o] + 0.587 * data[o + 1] + 0.114 * data[o + 2];
+    }
+
+    // The border ring is picture, not watermark, so it sets the brightness to beat.
+    const ring = [];
+    for (let x = 0; x < w; x += 1) {
+      ring.push(luma[x], luma[(h - 1) * w + x]);
+    }
+    for (let y = 0; y < h; y += 1) {
+      ring.push(luma[y * w], luma[y * w + w - 1]);
+    }
+    const mean = ring.reduce((a, b) => a + b, 0) / ring.length;
+    const sd = Math.sqrt(ring.reduce((a, b) => a + (b - mean) ** 2, 0) / ring.length);
+    const cutoff = mean + Math.max(6, SHAPE_SIGMA * sd);
+
+    for (let y = 0; y < h; y += 1) {
+      for (let x = 0; x < w; x += 1) {
+        if (luma[y * w + x] <= cutoff) continue;
+        for (let dy = -SHAPE_GROW; dy <= SHAPE_GROW; dy += 1) {
+          for (let dx = -SHAPE_GROW; dx <= SHAPE_GROW; dx += 1) {
+            const nx = x0 + x + dx;
+            const ny = y0 + y + dy;
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+            const q = ny * width + nx;
+            if (!flags[q]) {
+              flags[q] = 1;
+              marked += 1;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Too little means nothing was found; too much means it latched onto the picture itself.
+  const area = regions.reduce((sum, r) => sum + r.w * r.h, 0);
+  if (marked < 40 || marked > area * 2.5) return null;
+
+  const out = document.createElement("canvas");
+  out.width = width;
+  out.height = height;
+  const octx = out.getContext("2d");
+  const pixels = octx.createImageData(width, height);
+  for (let p = 0; p < flags.length; p += 1) {
+    const v = flags[p] ? 255 : 0;
+    pixels.data[p * 4] = v;
+    pixels.data[p * 4 + 1] = v;
+    pixels.data[p * 4 + 2] = v;
+    pixels.data[p * 4 + 3] = 255;
+  }
+  octx.putImageData(pixels, 0, 0);
+  return new Promise((resolveBlob) => out.toBlob(resolveBlob, "image/png"));
 }
 
 function readImageLuma() {
@@ -407,6 +494,11 @@ async function processVideo() {
 
   if (watermarkMatch) {
     formData.append("match", JSON.stringify(watermarkMatch));
+  } else {
+    // No calibrated profile for this mark, so trace its outline. Rebuilding only the glyph's
+    // own pixels keeps the surrounding picture that a bounding box would have thrown away.
+    const shape = await buildShapeMask();
+    if (shape) formData.append("shape", shape, "shape.png");
   }
 
   try {

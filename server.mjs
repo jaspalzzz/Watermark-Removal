@@ -136,6 +136,7 @@ async function handleProcess(req, res) {
   const regionsPart = parts.find((part) => part.name === "regions");
   const modePart = parts.find((part) => part.name === "mode");
   const matchPart = parts.find((part) => part.name === "match");
+  const shapePart = parts.find((part) => part.name === "shape");
 
   if (!video?.data?.length) {
     sendJson(res, 400, { error: "Upload a video or image first." });
@@ -160,6 +161,7 @@ async function handleProcess(req, res) {
   const jobId = randomUUID();
   const inputPath = join(tempDir, `${jobId}${inputExt}`);
   const maskPath = join(tempDir, `${jobId}-mask.png`);
+  const shapePath = join(tempDir, `${jobId}-shape.png`);
   // Named once the probe says whether this is a still or a clip, since the output keeps the
   // input's own format rather than being forced into an MP4.
   let outputName = "";
@@ -188,7 +190,7 @@ async function handleProcess(req, res) {
     // A recognised watermark can be un-blended, which restores the detail underneath.
     // Anything else falls back to delogo, which can only interpolate the area away.
     const placement = resolveUnblendPlacement(matchPart, metadata);
-    const method = placement ? "unblend" : "delogo";
+    let method = placement ? "unblend" : "delogo";
 
     // Feather radius scales with the frame so the removal blends on any resolution.
     const feather = clamp(Math.round(Math.min(metadata.width, metadata.height) * 0.012), 4, 14);
@@ -198,6 +200,11 @@ async function handleProcess(req, res) {
       let args;
       if (placement) {
         args = buildUnblendArgs(inputPath, partPath, placement, mode, metadata);
+      } else if (await writeShapeMask(shapePart, shapePath, metadata)) {
+        // A mask cut to the watermark's own outline beats a rectangle: the reconstruction only
+        // has to reach across the glyph's thin arms instead of a whole box of real picture.
+        method = "shaped";
+        args = buildRemoveLogoArgs(inputPath, shapePath, partPath, mode, metadata);
       } else {
         await buildFeatherMask(maskPath, cleanRegions, feather, metadata);
         args = buildFfmpegArgs(inputPath, maskPath, partPath, delogoRegions, mode, metadata);
@@ -224,6 +231,7 @@ async function handleProcess(req, res) {
   } finally {
     await fs.rm(inputPath, { force: true });
     await fs.rm(maskPath, { force: true });
+    await fs.rm(shapePath, { force: true });
     if (partPath) await fs.rm(partPath, { force: true });
   }
 }
@@ -397,6 +405,48 @@ function toEven(value) {
   return Math.round(value / 2) * 2;
 }
 
+// The client traces the watermark's outline and uploads it. It drives an ffmpeg filter, so it
+// is only trusted once the decoded PNG is confirmed to match the frame exactly.
+async function writeShapeMask(shapePart, shapePath, metadata) {
+  if (!shapePart?.data?.length) return false;
+
+  await fs.writeFile(shapePath, shapePart.data);
+  const size = await probeImageSize(shapePath);
+  if (!size || size.width !== metadata.width || size.height !== metadata.height) {
+    await fs.rm(shapePath, { force: true });
+    return false;
+  }
+
+  return true;
+}
+
+async function probeImageSize(filePath) {
+  try {
+    const payload = await runWithOutput("ffprobe", ["-v", "error", "-print_format", "json", "-show_streams", filePath]);
+    const stream = JSON.parse(payload).streams?.[0];
+    return stream ? { width: Number(stream.width), height: Number(stream.height) } : null;
+  } catch {
+    return null;
+  }
+}
+
+// removelogo rebuilds each masked pixel by interpolating from the nearest unmasked ones, so a
+// mask that hugs the glyph keeps surrounding detail that a bounding box would have discarded.
+function buildRemoveLogoArgs(inputPath, shapePath, outputPath, mode, metadata) {
+  const outputFormat = metadata.kind === "image" ? "rgb24" : metadata.pixelFormat || "yuv420p";
+
+  return [
+    "-hide_banner",
+    "-y",
+    "-i",
+    inputPath,
+    "-vf",
+    `removelogo=filename=${shapePath},format=${outputFormat}`,
+    ...outputArgs(mode, metadata),
+    outputPath
+  ];
+}
+
 // Renders a grayscale matte: white over each watermark box, softened outward so the
 // reconstructed patch dissolves into the surrounding pixels instead of leaving a rectangle.
 async function buildFeatherMask(maskPath, regions, feather, metadata) {
@@ -510,6 +560,7 @@ function normalizePixelFormat(pixelFormat) {
 function describeQuality(metadata, mode, method) {
   const removals = {
     unblend: "watermark un-blended from a calibrated profile, detail underneath restored",
+    shaped: "watermark traced and rebuilt from its own outline",
     delogo: "watermark interpolated away with feathered edges"
   };
   const removal = removals[method] || removals.delogo;
