@@ -20,6 +20,11 @@ const mimeTypes = new Map([
   [".mov", "video/quicktime"],
   [".webm", "video/webm"],
   [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".webp", "image/webp"],
+  [".bmp", "image/bmp"],
+  [".tiff", "image/tiff"],
   [".svg", "image/svg+xml"]
 ]);
 
@@ -133,7 +138,7 @@ async function handleProcess(req, res) {
   const matchPart = parts.find((part) => part.name === "match");
 
   if (!video?.data?.length) {
-    sendJson(res, 400, { error: "Upload a video file first." });
+    sendJson(res, 400, { error: "Upload a video or image first." });
     return;
   }
 
@@ -155,21 +160,28 @@ async function handleProcess(req, res) {
   const jobId = randomUUID();
   const inputPath = join(tempDir, `${jobId}${inputExt}`);
   const maskPath = join(tempDir, `${jobId}-mask.png`);
-  const outputName = `${safeBaseName(video.filename || "video")}-clean-${jobId.slice(0, 8)}.mp4`;
-  const outputPath = join(outputDir, outputName);
-  // Encode to a temp file and only publish it to /outputs on success, so an interrupted
-  // encode can never leave a half-written (unplayable) file in the outputs folder.
-  const partPath = join(tempDir, `${jobId}-out.mp4`);
+  // Named once the probe says whether this is a still or a clip, since the output keeps the
+  // input's own format rather than being forced into an MP4.
+  let outputName = "";
+  let outputPath = "";
+  // Written to a temp file and only published to /outputs on success, so an interrupted
+  // encode can never leave a half-written file in the outputs folder.
+  let partPath = "";
 
   await fs.writeFile(inputPath, video.data);
 
   try {
     const mode = modePart?.data?.toString("utf8") || "source";
     const metadata = await probeVideo(inputPath);
+    const outputExt = metadata.kind === "image" ? imageExtension(metadata, inputExt) : ".mp4";
+    outputName = `${safeBaseName(video.filename || "media")}-clean-${jobId.slice(0, 8)}${outputExt}`;
+    outputPath = join(outputDir, outputName);
+    partPath = join(tempDir, `${jobId}-out${outputExt}`);
+
     const cleanRegions = clampRegionsToFrame(uploadedRegions, metadata.width, metadata.height);
 
     if (!cleanRegions.length) {
-      sendJson(res, 422, { error: "The detected watermark area was outside the video. Please try again." });
+      sendJson(res, 422, { error: "The detected watermark area was outside the frame. Please try again." });
       return;
     }
 
@@ -194,8 +206,8 @@ async function handleProcess(req, res) {
       await fs.rename(partPath, outputPath);
     } catch (error) {
       console.error("FFmpeg processing failed:", summarizeProcessingError(error.message));
-      await fs.rm(partPath, { force: true });
-      await fs.rm(outputPath, { force: true });
+      if (partPath) await fs.rm(partPath, { force: true });
+      if (outputPath) await fs.rm(outputPath, { force: true });
       sendJson(res, 422, {
         error: "Could not remove the watermark automatically. Please try again or adjust the selected area."
       });
@@ -212,7 +224,7 @@ async function handleProcess(req, res) {
   } finally {
     await fs.rm(inputPath, { force: true });
     await fs.rm(maskPath, { force: true });
-    await fs.rm(partPath, { force: true });
+    if (partPath) await fs.rm(partPath, { force: true });
   }
 }
 
@@ -234,7 +246,13 @@ function resolveUnblendPlacement(matchPart, metadata) {
 
   const profile = watermarkProfiles.get(match?.profile);
   if (!profile) return null;
-  if (!Number.isFinite(match.score) || match.score < MIN_MATCH_SCORE) return null;
+
+  // The score gate exists to stop an automatic run from stamping an inverted watermark into
+  // clean media. A still cannot reach it (no temporal signal to average), so the UI shows the
+  // proposed area and the user confirms it — an explicit choice about their own file.
+  if (match.confirmed !== true && (!Number.isFinite(match.score) || match.score < MIN_MATCH_SCORE)) {
+    return null;
+  }
 
   const anchor = { x: Number(match.x), y: Number(match.y) };
   if (!Number.isFinite(anchor.x) || !Number.isFinite(anchor.y)) return null;
@@ -291,17 +309,21 @@ async function loadWatermarkProfiles() {
 // every pixel just to repair a corner of it.
 function buildUnblendArgs(inputPath, outputPath, placement, mode, metadata) {
   const { x, y, width, height, profile } = placement;
-  const pixelFormat = metadata.pixelFormat || "yuv420p";
+  const isImage = metadata.kind === "image";
+  // Stills stay in RGB end to end, so the patch never round-trips through 4:2:0 chroma.
+  const patchFormat = isImage ? "gbrp" : metadata.pixelFormat || "yuv420p";
 
   const filterComplex =
     `[1:v]scale=${width}:${height}:flags=bicubic,format=gbrp[offset];` +
     `[2:v]scale=${width}:${height}:flags=bicubic,format=gbrp[gain];` +
-    `[0:v]split=2[base][work];` +
-    `[work]format=gbrp,crop=${width}:${height}:${x}:${y}[patch];` +
+    `[0:v]${isImage ? "format=gbrp," : ""}split=2[base][work];` +
+    `[work]${isImage ? "" : "format=gbrp,"}crop=${width}:${height}:${x}:${y}[patch];` +
     `[patch][offset]blend=all_expr='max(A-B,0)'[shifted];` +
     `[shifted][gain]blend=all_expr='min(A*255/max(B,1),255)'[clean];` +
-    `[clean]format=${pixelFormat}[restored];` +
-    `[base][restored]overlay=${x}:${y}[out]`;
+    `[clean]format=${patchFormat}[restored];` +
+    // overlay defaults to a YUV working format, which would round-trip every pixel of a still
+    // through chroma conversion; format=rgb keeps the untouched area bit-identical.
+    `[base][restored]overlay=${x}:${y}${isImage ? ":format=rgb" : ""}[out]`;
 
   return [
     "-hide_banner",
@@ -316,15 +338,41 @@ function buildUnblendArgs(inputPath, outputPath, placement, mode, metadata) {
     filterComplex,
     "-map",
     "[out]",
+    ...outputArgs(mode, metadata),
+    outputPath
+  ];
+}
+
+// Stills are written back as a single frame in their own format; video keeps the audio track
+// and the faststart flag it needs for streaming.
+function outputArgs(mode, metadata) {
+  if (metadata.kind === "image") {
+    return ["-frames:v", "1", ...buildImageArgs(metadata)];
+  }
+
+  return [
     "-map",
     "0:a?",
     ...buildVideoArgs(mode, metadata),
     "-c:a",
     "copy",
     "-movflags",
-    "+faststart",
-    outputPath
+    "+faststart"
   ];
+}
+
+// Keeps the still in its own format; falls back to the uploaded extension, then PNG.
+function imageExtension(metadata, inputExt) {
+  const byCodec = { png: ".png", mjpeg: ".jpg", webp: ".webp", bmp: ".bmp", tiff: ".tiff" };
+  if (byCodec[metadata.codecName]) return byCodec[metadata.codecName];
+  return [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"].includes(inputExt) ? inputExt : ".png";
+}
+
+function buildImageArgs(metadata) {
+  // PNG and WebP are written losslessly; JPEG has no lossless mode, so use its top quality.
+  if (metadata.codecName === "mjpeg") return ["-q:v", "2", "-pix_fmt", "yuvj444p"];
+  if (metadata.codecName === "webp") return ["-lossless", "1"];
+  return ["-pix_fmt", "rgb24"];
 }
 
 // Maps a detected sparkle position onto the calibrated patch, scaling for resolution.
@@ -332,10 +380,12 @@ function buildUnblendArgs(inputPath, outputPath, placement, mode, metadata) {
 // cropping or overlaying at an odd offset in 4:2:0 shifts chroma and wrecks the alignment.
 function resolvePlacement(profile, anchor, metadata) {
   const scale = metadata.height / profile.reference.height;
-  const width = toEven(profile.patch.width * scale);
-  const height = toEven(profile.patch.height * scale);
-  const x = toEven(anchor.x - profile.anchor.x * scale);
-  const y = toEven(anchor.y - profile.anchor.y * scale);
+  // Stills stay in RGB, so they can sit on exact pixels; only 4:2:0 video needs even offsets.
+  const snap = metadata.kind === "image" ? Math.round : toEven;
+  const width = snap(profile.patch.width * scale);
+  const height = snap(profile.patch.height * scale);
+  const x = snap(anchor.x - profile.anchor.x * scale);
+  const y = snap(anchor.y - profile.anchor.y * scale);
 
   if (width < 8 || height < 8) return null;
   if (x < 0 || y < 0 || x + width > metadata.width || y + height > metadata.height) return null;
@@ -385,13 +435,12 @@ function buildFfmpegArgs(inputPath, maskPath, outputPath, regions, mode, metadat
 
   // Reconstruct on a copy of the frame, attach the feathered matte as alpha, then blend it
   // back over the untouched original so only the softened watermark area is replaced.
+  const outputFormat = metadata.kind === "image" ? "rgb24" : metadata.pixelFormat || "yuv420p";
   const filterComplex =
     `[0:v]split=2[base][work];` +
     `[work]${delogoChain}[clean];` +
     `[clean][1:v]alphamerge[patch];` +
-    `[base][patch]overlay=0:0:format=auto,format=${metadata.pixelFormat || "yuv420p"}[out]`;
-
-  const videoArgs = buildVideoArgs(mode, metadata);
+    `[base][patch]overlay=0:0:format=auto,format=${outputFormat}[out]`;
 
   return [
     "-hide_banner",
@@ -404,13 +453,7 @@ function buildFfmpegArgs(inputPath, maskPath, outputPath, regions, mode, metadat
     filterComplex,
     "-map",
     "[out]",
-    "-map",
-    "0:a?",
-    ...videoArgs,
-    "-c:a",
-    "copy",
-    "-movflags",
-    "+faststart",
+    ...outputArgs(mode, metadata),
     outputPath
   ];
 }
@@ -430,6 +473,8 @@ function buildVideoArgs(mode, metadata) {
     : ["-c:v", "libx264", "-preset", "slow", "-crf", "16", "-pix_fmt", pixelFormat];
 }
 
+const imageCodecs = new Set(["png", "mjpeg", "webp", "bmp", "tiff", "gif"]);
+
 async function probeVideo(filePath) {
   const payload = await runWithOutput("ffprobe", [
     "-v",
@@ -443,9 +488,14 @@ async function probeVideo(filePath) {
 
   const parsed = JSON.parse(payload);
   const stream = parsed.streams?.find((item) => item.codec_type === "video") || {};
+  const codecName = stream.codec_name || "";
+  // A still has no meaningful duration and decodes as an image codec. Images skip 4:2:0
+  // entirely, so they avoid both the chroma subsampling loss and the even-pixel constraint.
+  const isImage = imageCodecs.has(codecName) && !(Number(parsed.format?.duration) > 0.2);
 
   return {
-    codecName: stream.codec_name || "",
+    kind: isImage ? "image" : "video",
+    codecName,
     width: Number(stream.width || 0),
     height: Number(stream.height || 0),
     pixelFormat: normalizePixelFormat(stream.pix_fmt)
@@ -463,6 +513,11 @@ function describeQuality(metadata, mode, method) {
     delogo: "watermark interpolated away with feathered edges"
   };
   const removal = removals[method] || removals.delogo;
+
+  if (metadata.kind === "image") {
+    const lossless = metadata.codecName !== "mjpeg";
+    return `${removal}; ${lossless ? "lossless" : "high-quality JPEG"} still`;
+  }
 
   if (mode === "fast") {
     return `${removal}; fast export`;

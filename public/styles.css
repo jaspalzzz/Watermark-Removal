@@ -188,6 +188,7 @@ select {
 }
 
 .stage video,
+.stage img,
 .stage canvas {
   max-width: 100%;
   max-height: calc(100vh - 160px);
@@ -206,13 +207,23 @@ select {
 }
 
 .stage.is-empty::after {
-  content: "Drop a video above to begin";
+  content: "Drop a video or image above to begin";
   color: var(--muted);
   font-size: 0.95rem;
 }
 
 .stage.is-empty video,
+.stage.is-empty img,
 .stage.is-empty canvas {
+  display: none;
+}
+
+.stage img {
+  display: block;
+}
+
+.stage video[hidden],
+.stage img[hidden] {
   display: none;
 }
 

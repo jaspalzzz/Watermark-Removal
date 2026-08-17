@@ -11,17 +11,18 @@
       <section class="workspace" aria-label="Video editor">
         <div class="video-panel">
           <div class="drop-zone" id="dropZone">
-            <input id="videoInput" type="file" accept="video/mp4,video/quicktime,video/webm,video/*" />
+            <input id="videoInput" type="file" accept="video/mp4,video/quicktime,video/webm,video/*,image/png,image/jpeg,image/webp,image/*" />
             <div class="drop-copy">
               <span class="drop-icon" aria-hidden="true">+</span>
-              <strong>Drop video here</strong>
+              <strong>Drop video or image here</strong>
               <span>Watermark removal starts automatically</span>
-              <small>MP4, MOV, WebM</small>
+              <small>MP4, MOV, WebM &middot; PNG, JPG, WebP</small>
             </div>
           </div>
 
           <div class="stage is-empty" id="stage">
             <video id="video" controls playsinline preload="auto"></video>
+            <img id="image" alt="Uploaded image preview" hidden />
             <canvas id="overlay"></canvas>
           </div>
         </div>

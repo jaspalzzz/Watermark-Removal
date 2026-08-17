@@ -2,6 +2,7 @@ const videoInput = document.querySelector("#videoInput");
 const dropZone = document.querySelector("#dropZone");
 const stage = document.querySelector("#stage");
 const video = document.querySelector("#video");
+const image = document.querySelector("#image");
 const overlay = document.querySelector("#overlay");
 const ctx = overlay.getContext("2d");
 const detectButton = document.querySelector("#detectButton");
@@ -26,6 +27,25 @@ let autoProcessStarted = false;
 let firstFrameHandled = false;
 let progressTimer = null;
 let watermarkMatch = null;
+let mediaKind = "video";
+
+// The stage holds a <video> or an <img>; everything downstream works off these accessors so
+// the overlay, region maths and detection do not care which one is loaded.
+function activeMedia() {
+  return mediaKind === "image" ? image : video;
+}
+
+function mediaWidth() {
+  return mediaKind === "image" ? image.naturalWidth : video.videoWidth;
+}
+
+function mediaHeight() {
+  return mediaKind === "image" ? image.naturalHeight : video.videoHeight;
+}
+
+function mediaReady() {
+  return mediaKind === "image" ? image.complete && image.naturalWidth > 0 : video.readyState >= 2;
+}
 
 // Calibrated watermark profile (Veo/Gemini sparkle). When the uploaded video matches it we can
 // reverse the watermark's blend instead of interpolating the area away, which preserves detail.
@@ -94,7 +114,7 @@ video.addEventListener("loadedmetadata", () => {
   stage.classList.remove("is-empty");
   fitOverlay();
   setProgress(18, "Reading video", "detect");
-  setStatus(`${Math.round(video.videoWidth)} x ${Math.round(video.videoHeight)} loaded. Detecting watermark...`);
+  setStatus(`${Math.round(mediaWidth())} x ${Math.round(mediaHeight())} loaded. Detecting watermark...`);
   handleFirstFrame();
 });
 
@@ -112,20 +132,20 @@ window.addEventListener("resize", fitOverlay);
 overlay.addEventListener("pointerdown", (event) => {
   if (!selectedFile || isProcessing) return;
   overlay.setPointerCapture(event.pointerId);
-  dragStart = pointerToVideoPoint(event);
+  dragStart = pointerToMediaPoint(event);
   draft = null;
 });
 
 overlay.addEventListener("pointermove", (event) => {
   if (!dragStart) return;
-  const current = pointerToVideoPoint(event);
+  const current = pointerToMediaPoint(event);
   draft = rectFromPoints(dragStart, current);
   drawOverlay();
 });
 
 overlay.addEventListener("pointerup", (event) => {
   if (!dragStart) return;
-  const current = pointerToVideoPoint(event);
+  const current = pointerToMediaPoint(event);
   const region = rectFromPoints(dragStart, current);
   dragStart = null;
   draft = null;
@@ -141,8 +161,8 @@ overlay.addEventListener("pointerup", (event) => {
 });
 
 detectButton.addEventListener("click", () => {
-  if (!selectedFile || !video.videoWidth || !video.videoHeight) {
-    setStatus("Load a video before detection.", true);
+  if (!selectedFile || !mediaWidth() || !mediaHeight()) {
+    setStatus("Load a video or image before detection.", true);
     return;
   }
 
@@ -160,11 +180,14 @@ processButton.addEventListener("click", async () => {
 });
 
 function loadVideo(file) {
-  if (!file.type.startsWith("video/")) {
-    setStatus("Drop a video file.", true);
+  const isVideo = file.type.startsWith("video/");
+  const isImage = file.type.startsWith("image/");
+  if (!isVideo && !isImage) {
+    setStatus("Drop a video or image file.", true);
     return;
   }
 
+  mediaKind = isImage ? "image" : "video";
   selectedFile = file;
   regions = [];
   isProcessing = false;
@@ -174,20 +197,84 @@ function loadVideo(file) {
   stopProgressTimer();
   downloadLink.hidden = true;
   detectButton.disabled = true;
-  processButton.textContent = "Process again";
-  video.autoplay = false;
-  video.pause();
-  video.src = URL.createObjectURL(file);
-  video.load();
+  processButton.textContent = isImage ? "Remove watermark" : "Process again";
+  video.hidden = isImage;
+  image.hidden = !isImage;
+
+  if (isImage) {
+    video.pause();
+    video.removeAttribute("src");
+    image.src = URL.createObjectURL(file);
+  } else {
+    image.removeAttribute("src");
+    video.autoplay = false;
+    video.pause();
+    video.src = URL.createObjectURL(file);
+    video.load();
+  }
+
   stage.classList.remove("is-empty");
   dropZone.classList.add("has-file");
   setProgress(8, `Loaded ${formatBytes(file.size)}`, "upload");
-  setStatus("Preparing automatic removal...");
+  setStatus(isImage ? "Reading image..." : "Preparing automatic removal...");
   updateUi();
 }
 
+image.addEventListener("load", () => {
+  if (mediaKind !== "image") return;
+  stage.classList.remove("is-empty");
+  fitOverlay();
+  setProgress(18, "Reading image", "detect");
+  setStatus(`${mediaWidth()} x ${mediaHeight()} loaded. Looking for a watermark...`);
+  void handleImageLoaded();
+});
+
+// A still has no temporal signal, so the match cannot reach the confidence a clip does
+// (measured 0.55 against the 0.75 auto threshold) even when it lands on the right pixel.
+// The position is still trustworthy, so the box is proposed and the user confirms it rather
+// than the removal running by itself.
+const IMAGE_SUGGEST_THRESHOLD = 0.35;
+
+async function handleImageLoaded() {
+  const profile = await profilePromise;
+  const frame = readImageLuma();
+  const suggestion = matchWatermarkProfile(profile, frame, IMAGE_SUGGEST_THRESHOLD);
+
+  if (suggestion) {
+    // Confirmed by the user rather than by score, so the server allows the un-blend through.
+    watermarkMatch = { ...suggestion, confirmed: true };
+    regions = [{ x: suggestion.x, y: suggestion.y, w: suggestion.w, h: suggestion.h }];
+    updateUi();
+    setProgress(30, "Check the area", "detect");
+    setStatus("Found a likely Veo sparkle (highlighted). Press Remove watermark to confirm, or drag your own box.");
+    return;
+  }
+
+  autoDetectWatermark();
+  setStatus("No known watermark found. Drag a box over the watermark, then press Remove watermark.");
+}
+
+function readImageLuma() {
+  const width = mediaWidth();
+  const height = mediaHeight();
+  if (!width || !height) return null;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  context.drawImage(image, 0, 0);
+  const { data } = context.getImageData(0, 0, width, height);
+  const luma = new Float32Array(width * height);
+  for (let p = 0; p < luma.length; p += 1) {
+    const o = p * 4;
+    luma[p] = 0.299 * data[o] + 0.587 * data[o + 1] + 0.114 * data[o + 2];
+  }
+  return { luma, width, height };
+}
+
 function fitOverlay() {
-  const rect = video.getBoundingClientRect();
+  const rect = activeMedia().getBoundingClientRect();
   overlay.style.width = `${rect.width}px`;
   overlay.style.height = `${rect.height}px`;
   overlay.width = Math.max(1, Math.round(rect.width * window.devicePixelRatio));
@@ -195,13 +282,13 @@ function fitOverlay() {
   drawOverlay();
 }
 
-function pointerToVideoPoint(event) {
+function pointerToMediaPoint(event) {
   const rect = overlay.getBoundingClientRect();
-  const scaleX = video.videoWidth / rect.width;
-  const scaleY = video.videoHeight / rect.height;
+  const scaleX = mediaWidth() / rect.width;
+  const scaleY = mediaHeight() / rect.height;
   return {
-    x: clamp((event.clientX - rect.left) * scaleX, 0, video.videoWidth),
-    y: clamp((event.clientY - rect.top) * scaleY, 0, video.videoHeight)
+    x: clamp((event.clientX - rect.left) * scaleX, 0, mediaWidth()),
+    y: clamp((event.clientY - rect.top) * scaleY, 0, mediaHeight())
   };
 }
 
@@ -233,9 +320,9 @@ function drawOverlay() {
 }
 
 function drawRegion(region, fill, stroke) {
-  const rect = overlay.getBoundingClientRect();
-  const scaleX = rect.width / video.videoWidth;
-  const scaleY = rect.height / video.videoHeight;
+  const rect = activeMedia().getBoundingClientRect();
+  const scaleX = rect.width / mediaWidth();
+  const scaleY = rect.height / mediaHeight();
   const x = region.x * scaleX;
   const y = region.y * scaleY;
   const w = region.w * scaleX;
@@ -309,7 +396,7 @@ async function processVideo() {
   processButton.textContent = "Processing...";
   updateUi();
   downloadLink.hidden = true;
-  video.pause();
+  if (mediaKind === "video") video.pause();
   setProgress(32, "Uploading video", "upload");
   setStatus("Removing watermark with FFmpeg...");
 
@@ -343,7 +430,7 @@ async function processVideo() {
 }
 
 function autoDetectWatermark(replaceExisting = false) {
-  if (!selectedFile || !video.videoWidth || !video.videoHeight || video.readyState < 2) return;
+  if (!selectedFile || !mediaWidth() || !mediaHeight() || !mediaReady()) return;
 
   const detected = detectLikelyWatermarkRegion();
   if (replaceExisting) regions = [];
@@ -356,7 +443,7 @@ function autoDetectWatermark(replaceExisting = false) {
     return;
   }
 
-  const fallback = getCommonWatermarkRegion(video.videoWidth, video.videoHeight);
+  const fallback = getCommonWatermarkRegion(mediaWidth(), mediaHeight());
   regions = replaceExisting || !regions.length ? [fallback] : regions;
   updateUi();
   setProgress(24, "Watermark area selected", "detect");
@@ -364,7 +451,8 @@ function autoDetectWatermark(replaceExisting = false) {
 }
 
 async function handleFirstFrame() {
-  if (firstFrameHandled || !selectedFile || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return;
+  if (mediaKind !== "video") return;
+  if (firstFrameHandled || !selectedFile || video.readyState < 2 || !mediaWidth() || !mediaHeight()) return;
 
   firstFrameHandled = true;
   video.pause();
@@ -395,11 +483,11 @@ async function handleFirstFrame() {
 }
 
 function handleDroppedFiles(fileList) {
-  const file = [...fileList].find((item) => item.type.startsWith("video/"));
+  const file = [...fileList].find((item) => item.type.startsWith("video/") || item.type.startsWith("image/"));
   if (file) {
     loadVideo(file);
   } else {
-    setStatus("Drop a video file.", true);
+    setStatus("Drop a video or image file.", true);
   }
 }
 
@@ -491,8 +579,8 @@ function formatBytes(bytes) {
 const MATCH_SAMPLES = 12;
 
 async function buildAverageLuma() {
-  const width = video.videoWidth;
-  const height = video.videoHeight;
+  const width = mediaWidth();
+  const height = mediaHeight();
   const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
   // Without a duration there is nothing to spread samples across, and a single frame is not
   // enough to match on: it scored 0.51 and landed 20px off the watermark while testing.
@@ -562,7 +650,7 @@ function seekTo(time) {
 
 // Looks for the calibrated sparkle near its expected spot and scores the fit with zero-mean
 // normalised cross-correlation, which is robust to whatever brightness sits behind it.
-function matchWatermarkProfile(profile, frame) {
+function matchWatermarkProfile(profile, frame, threshold = MATCH_THRESHOLD) {
   if (!profile || !frame) return null;
 
   const { luma, width: videoWidth, height: videoHeight } = frame;
@@ -592,7 +680,7 @@ function matchWatermarkProfile(profile, frame) {
     }
   }
 
-  if (!best || best.score < MATCH_THRESHOLD) return null;
+  if (!best || best.score < threshold) return null;
   return { profile: profile.name, x: best.x, y: best.y, score: Number(best.score.toFixed(4)), w: tw, h: th };
 }
 
@@ -641,15 +729,15 @@ function correlate(luma, lumaWidth, dx, dy, template, tw, th) {
 }
 
 function detectLikelyWatermarkRegion() {
-  const sourceWidth = video.videoWidth;
-  const sourceHeight = video.videoHeight;
+  const sourceWidth = mediaWidth();
+  const sourceHeight = mediaHeight();
   const scale = Math.min(1, 960 / sourceWidth);
   const canvas = document.createElement("canvas");
   canvas.width = Math.max(1, Math.round(sourceWidth * scale));
   canvas.height = Math.max(1, Math.round(sourceHeight * scale));
 
   const canvasContext = canvas.getContext("2d", { willReadFrequently: true });
-  canvasContext.drawImage(video, 0, 0, canvas.width, canvas.height);
+  canvasContext.drawImage(activeMedia(), 0, 0, canvas.width, canvas.height);
 
   const zones = getDetectionZones(canvas.width, canvas.height);
   const candidates = zones
