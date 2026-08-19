@@ -567,11 +567,14 @@ async function handleFirstFrame() {
     return;
   }
 
-  // 2. Not a watermark we have calibrated: fall back to a coarse guess and tell the user
-  // plainly, so they can drag the box themselves rather than trust a bad automatic one.
+  // 2. Not a watermark we have calibrated. The generic heuristic guesses from raw pixel
+  // brightness, which a busy or brightly lit scene can fool into a box spanning half the
+  // frame (reproduced on a bright store interior: a 320x197 box over a 48x48 mark). Unlike
+  // the calibrated match above, this guess is not confirmed to be right, so it is proposed
+  // for review instead of processed automatically — the same rule images already follow.
   autoDetectWatermark();
-  setStatus("No known watermark found. Check the highlighted area and drag your own box if it is wrong.");
-  startAutoProcess();
+  setProgress(30, "Check the area", "detect");
+  setStatus("No known watermark matched confidently. Check the highlighted area, adjust it if needed, then press Process again.");
 }
 
 function handleDroppedFiles(fileList) {

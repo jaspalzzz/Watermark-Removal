@@ -210,6 +210,7 @@ async function handleProcess(req, res) {
         args = buildFfmpegArgs(inputPath, maskPath, partPath, delogoRegions, mode, metadata);
       }
       await run("ffmpeg", args);
+      await assertRenderedOutput(partPath, metadata);
       await fs.rename(partPath, outputPath);
     } catch (error) {
       console.error("FFmpeg processing failed:", summarizeProcessingError(error.message));
@@ -405,6 +406,32 @@ function toEven(value) {
   return Math.round(value / 2) * 2;
 }
 
+// ffmpeg can exit cleanly having written a file that is valid but wrong — a stream-selection
+// slip once produced an audio-only MP4 that probed fine. Confirm the render actually contains
+// the picture, at the size we asked for, before it is published to /outputs.
+async function assertRenderedOutput(filePath, metadata) {
+  const payload = await runWithOutput("ffprobe", [
+    "-v",
+    "error",
+    "-print_format",
+    "json",
+    "-show_streams",
+    filePath
+  ]);
+
+  const streams = JSON.parse(payload).streams || [];
+  const rendered = streams.find((stream) => stream.codec_type === "video");
+  if (!rendered) {
+    throw new Error("output has no video stream");
+  }
+
+  if (Number(rendered.width) !== metadata.width || Number(rendered.height) !== metadata.height) {
+    throw new Error(
+      `output is ${rendered.width}x${rendered.height}, expected ${metadata.width}x${metadata.height}`
+    );
+  }
+}
+
 // The client traces the watermark's outline and uploads it. It drives an ffmpeg filter, so it
 // is only trusted once the decoded PNG is confirmed to match the frame exactly.
 async function writeShapeMask(shapePart, shapePath, metadata) {
@@ -442,6 +469,10 @@ function buildRemoveLogoArgs(inputPath, shapePath, outputPath, mode, metadata) {
     inputPath,
     "-vf",
     `removelogo=filename=${shapePath},format=${outputFormat}`,
+    // The audio map below turns off ffmpeg's automatic stream selection, so the video has to
+    // be mapped by hand too. Without this the filtered video is dropped and the file written
+    // out with only its audio track.
+    ...(metadata.kind === "image" ? [] : ["-map", "0:v:0"]),
     ...outputArgs(mode, metadata),
     outputPath
   ];
