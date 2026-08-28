@@ -235,6 +235,15 @@ image.addEventListener("load", () => {
 // than the removal running by itself.
 const IMAGE_SUGGEST_THRESHOLD = 0.35;
 
+// A still image's match position can be trustworthy while its correlation score still
+// undershoots the glyph's true size: on a low-contrast background (a pale stone floor, for
+// one reported case) the peak search can lock onto a smaller, noisier crop than the whole
+// mark, leaving its far edge outside the box entirely. Padding the box the user is shown
+// costs a little extra surrounding picture if the fit was already good; leaving it tight
+// risks a visible sliver of the watermark surviving. The user still sees and can adjust it
+// before anything is processed.
+const IMAGE_SUGGESTION_PADDING = 0.4;
+
 async function handleImageLoaded() {
   const profile = await profilePromise;
   const frame = readImageLuma();
@@ -246,10 +255,23 @@ async function handleImageLoaded() {
     // and a still gives no way to confirm that: a Gemini image carries a different mark from
     // the Veo clip the profile was built from, and using it there only half-removes the mark.
     watermarkMatch = null;
-    regions = [{ x: suggestion.x, y: suggestion.y, w: suggestion.w, h: suggestion.h }];
+    const padX = Math.round(suggestion.w * IMAGE_SUGGESTION_PADDING);
+    const padY = Math.round(suggestion.h * IMAGE_SUGGESTION_PADDING);
+    const width = mediaWidth();
+    const height = mediaHeight();
+    const x = clamp(suggestion.x - padX, 0, width - 1);
+    const y = clamp(suggestion.y - padY, 0, height - 1);
+    regions = [
+      {
+        x,
+        y,
+        w: clamp(suggestion.w + padX * 2, 8, width - x),
+        h: clamp(suggestion.h + padY * 2, 8, height - y)
+      }
+    ];
     updateUi();
     setProgress(30, "Check the area", "detect");
-    setStatus("Found a likely watermark (highlighted). Press Remove watermark to confirm, or drag your own box.");
+    setStatus("Found a likely watermark (highlighted, with a margin for a faint edge). Press Remove watermark to confirm, or drag your own box.");
     return;
   }
 
